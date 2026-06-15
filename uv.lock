@@ -2892,12 +2892,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "crawl4ai" },
     { name = "fastmcp", extra = ["apps"] },
+    { name = "playwright" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "crawl4ai", specifier = ">=0.8.9" },
     { name = "fastmcp", extras = ["apps"], specifier = ">=3.4.2" },
+    { name = "playwright", specifier = ">=1.60.0" },
 ]
 
 [[package]]

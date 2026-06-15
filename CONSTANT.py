@@ -1,1 +1,1 @@
-SEARCH_ENGINE="https://google.com/search?q="
+SEARCH_ENGINE="https://duckduckgo.com/search?q="

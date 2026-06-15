@@ -1,21 +1,25 @@
 from crawl4ai import AsyncWebCrawler
-from CONSTANT import SEARCH_ENGINE
-from models import QueryParams
 from fastmcp.tools import tool
 
 @tool
-async def search_tool(query: QueryParams) -> str:
-    '''This tool searches the internet
-        It receives QueryParams as a parameter, which includes q(Which is query itself), limit(Which is Optional) and Skip(Which is Optional)
-        This tool returns the result as markdown str
+async def fetch_website_content_tool(url: str, content: str) -> str:
+    '''This tool visit the website and fetch its contents return as markdown or clean_html format
+        It receives url: str as parameter
+        This tool returns the result as html or markdown str
+
+        Example: url: test.com, content: 'markdown'
+        Example #2: url: test.com, content: 'html'
+
+        Currently only 2 content are available, ['html', 'markdown']
     '''
-    q, limit, skip = query.q, query.limit, query.skip
-    url = SEARCH_ENGINE + q
-    print(url)
+    print(url, content)
     async with AsyncWebCrawler() as crawler:
         result = await crawler.arun(
             url= url
         )
+
+        if content == 'html': return result.cleaned_html
+
         markdown = result.markdown
 
         if markdown is None:
