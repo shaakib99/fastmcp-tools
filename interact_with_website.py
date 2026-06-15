@@ -4,7 +4,7 @@ from fastmcp.tools import tool
 import asyncio
 
 @tool
-async def interact_with_website(data_model: WebsiteInteractionModel) -> str:
+async def interact_with_website_tool(data_model: WebsiteInteractionModel) -> str:
     '''
         This tool interacts with websites: fills inputs, clicks buttons.
         

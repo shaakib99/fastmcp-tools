@@ -5,10 +5,26 @@ from fastmcp.tools import tool
 
 @tool
 async def search_tool(query: QueryParams) -> str:
-    '''This tool searches the internet
-        It receives QueryParams as a parameter, which includes q(Which is query itself), limit(Which is Optional) and Skip(Which is Optional)
-        This tool returns the result as markdown str
-    '''
+    """
+    Searches the internet and returns results as a markdown-formatted string.
+
+    Use this tool when you need to:
+    - Find current or real-time information
+    - Research a topic, person, or event
+    - Verify facts or look up unknown data
+
+    Args:
+        query (QueryParams): Search parameters including:
+            - q        (str)           : The search query string (required)
+            - limit    (int, optional) : Maximum number of results to return
+            - skip     (int, optional) : Number of results to skip (for pagination)
+
+    Returns:
+        str: Search results formatted as markdown
+
+    Example:
+        result = await search_tool(QueryParams(q="latest AI news", limit=5, skip=0))
+    """
     q, limit, skip = query.q, query.limit, query.skip
     url = SEARCH_ENGINE + q
     print(url)

@@ -2,7 +2,9 @@ from fastmcp import FastMCP
 from contextlib import asynccontextmanager
 from search import search_tool
 from fetch_website_content import fetch_website_content_tool
-from interact_with_website import interact_with_website
+from interact_with_website import interact_with_website_tool
+from system_command import run_system_command_tool
+from get_operating_system import get_operating_system_tool
 import sys
 import asyncio
 
@@ -15,5 +17,11 @@ async def lifespan(app: FastMCP):
 
 mcp = FastMCP("Collection Tools")
 
-tools: list = [search_tool, fetch_website_content_tool, interact_with_website]
+tools: list = [
+    search_tool, 
+    fetch_website_content_tool, 
+    interact_with_website_tool,
+    run_system_command_tool,
+    get_operating_system_tool
+    ]
 for tool in tools: mcp.add_tool(tool)
