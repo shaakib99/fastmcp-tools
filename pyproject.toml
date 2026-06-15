@@ -1,0 +1,10 @@
+[project]
+name = "tools"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.10"
+dependencies = [
+    "crawl4ai>=0.8.9",
+    "fastmcp[apps]>=3.4.2",
+]
