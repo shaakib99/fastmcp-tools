@@ -12,6 +12,7 @@ async def search_tool(query: QueryParams) -> str:
     - Find current or real-time information
     - Research a topic, person, or event
     - Verify facts or look up unknown data
+    - Lookup latest information on the internet
 
     Args:
         query (QueryParams): Search parameters including:

@@ -29,4 +29,4 @@ async def fetch_website_content_tool(url: str, content: str) -> str:
         if hasattr(markdown, 'raw_markdown'):
             markdown = markdown.raw_markdown or "No results found."
         
-        return str(markdown)  # ensure it's always a plain str
+        return str(markdown or '')  # ensure it's always a plain str

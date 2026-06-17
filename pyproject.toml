@@ -8,4 +8,5 @@ dependencies = [
     "crawl4ai>=0.8.9",
     "fastmcp[apps]>=3.4.2",
     "playwright>=1.60.0",
+    "pypdf>=6.13.2",
 ]

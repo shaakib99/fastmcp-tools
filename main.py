@@ -5,6 +5,9 @@ from fetch_website_content import fetch_website_content_tool
 from interact_with_website import interact_with_website_tool
 from system_command import run_system_command_tool
 from get_operating_system import get_operating_system_tool
+from read_text_file import read_text_file_tool
+from read_pdf_file import read_pdf_tool
+from write_into_file import write_into_file_tool
 import sys
 import asyncio
 
@@ -22,6 +25,9 @@ tools: list = [
     fetch_website_content_tool, 
     interact_with_website_tool,
     run_system_command_tool,
-    get_operating_system_tool
+    get_operating_system_tool,
+    read_text_file_tool,
+    read_pdf_tool,
+    write_into_file_tool
     ]
 for tool in tools: mcp.add_tool(tool)
