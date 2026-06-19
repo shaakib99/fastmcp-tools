@@ -29,7 +29,7 @@ tools: list = [
     run_system_command_tool,
     get_operating_system_tool,
     read_text_file_tool,
-    read_pdf_tool,
+    # read_pdf_tool,
     write_into_file_tool,
     find_browser_path_tool,
     control_web_browser_tool
