@@ -6,7 +6,7 @@ import asyncio
 @tool
 async def interact_with_website_tool(data_model: WebsiteInteractionModel) -> str:
     '''
-        This tool interacts with websites: fills inputs, clicks buttons.
+        This tool interacts with websites: fills inputs, clicks buttons, close page, close browser.
         
         IMPORTANT: Use only simple, short CSS selectors:
         - Prefer IDs: #prompt, #sendBtn
@@ -19,6 +19,9 @@ async def interact_with_website_tool(data_model: WebsiteInteractionModel) -> str
         "actions_by_sequence": [
             { "action": "fill",  "tag": "#testInput",  "value": "your text" },
             { "action": "click", "tag": "#testBtn", "value": "" }
+            { "action": "close_page", "tag": "", "value": "" }
+            { "action": "close_browser", "tag": "", "value": "" }
+
         ]
         }
         
@@ -57,6 +60,11 @@ async def interact_with_website_tool(data_model: WebsiteInteractionModel) -> str
                     await locator.click()
                     await page.wait_for_load_state('networkidle', timeout=30000)
                     await asyncio.sleep(30)
+                elif action.action == 'close_page':
+                    await page.wait_for_load_state('networkidle', timeout=30000)
+                    await page.close()
+                elif action.action == 'close_browser':
+                    await browser.close()
 
             except Exception as e:
                 response = e.__str__()
@@ -64,6 +72,6 @@ async def interact_with_website_tool(data_model: WebsiteInteractionModel) -> str
 
         await page.wait_for_load_state('networkidle', timeout=30000)
         if response is None: response = await page.content()
-        await page.close()
-        await browser.close()
+        # await page.close()
+        # await browser.close()
     return response
