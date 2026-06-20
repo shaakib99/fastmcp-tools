@@ -70,7 +70,7 @@ async def control_web_browser_tool(default_browser_path: str, url: str, goals: l
 
             Return ONLY a JSON object with this shape:
             {{
-                "action": "fill | click | done | wait_for_user | close_browser | navigate | ask_user",
+                "action": "fill | click | done | wait_for_user | return_content_to_the_parent | go_to_previous_page | close_browser | navigate | ask_user",
                 "selector": "valid CSS selector string",
                 "value": "text to fill (empty string if not fill)",
                 "goal_completed": "description of what was just done, or null"
@@ -153,6 +153,18 @@ async def control_web_browser_tool(default_browser_path: str, url: str, goals: l
                 elif action == "wait_for_user":
                     return f'Handing over the control to the user'
 
+                elif action == "return_content_to_the_parent":
+                    content = await page.content()
+                    await page.close()
+                    await browser.close()
+                    return content
+
+                elif action == "go_to_previous_page":
+                    await page.go_back()
+                    await page.wait_for_load_state('domcontentloaded', timeout=30000)
+
+                    last_result = f'Went back to previous page'
+                
                 elif action == "navigate":
                     await page.goto(value)
                     await page.wait_for_load_state('networkidle', timeout=30000)
