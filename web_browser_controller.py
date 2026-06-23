@@ -13,23 +13,36 @@ import asyncio
 # ---------------------------------------------------------------------------
 
 async def wait_for_page_settled(page, timeout: int = 30_000) -> None:
+    """
+    Wait until the page is truly idle:
+      1. domcontentloaded  – HTML parsed
+      2. networkidle       – no in-flight requests for 500 ms (best-effort)
+      3. DOM stability     – no new nodes added for 300 ms
+    Each step gracefully degrades on timeout so we never hard-crash here.
+    """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError:
         pass
+
     try:
         await page.wait_for_load_state("networkidle", timeout=min(timeout, 10_000))
     except PlaywrightTimeoutError:
         pass
+
     try:
         await page.evaluate("""() => new Promise((resolve) => {
-            let lastCount = -1, stable = 0;
+            let lastCount = -1;
+            let stable = 0;
             const check = () => {
                 const count = document.querySelectorAll('*').length;
                 if (count === lastCount) {
                     stable++;
                     if (stable >= 3) return resolve();
-                } else { stable = 0; lastCount = count; }
+                } else {
+                    stable = 0;
+                    lastCount = count;
+                }
                 setTimeout(check, 100);
             };
             check();
@@ -39,14 +52,34 @@ async def wait_for_page_settled(page, timeout: int = 30_000) -> None:
 
 
 async def wait_for_dom_mutation(page, timeout: int = 8_000) -> bool:
+    """
+    After a dropdown selection, the page may re-render new fields via JS.
+    This waits for ANY DOM mutation to occur within `timeout` ms, then
+    waits for the DOM to fully settle before returning.
+    """
     try:
         mutated = await page.evaluate(f"""() => new Promise((resolve) => {{
             let resolved = false;
-            const observer = new MutationObserver(() => {{
-                if (!resolved) {{ resolved = true; observer.disconnect(); resolve(true); }}
+            const observer = new MutationObserver((mutations) => {{
+                if (!resolved) {{
+                    resolved = true;
+                    observer.disconnect();
+                    resolve(true);
+                }}
             }});
-            observer.observe(document.body, {{ childList: true, subtree: true, attributes: true }});
-            setTimeout(() => {{ if (!resolved) {{ resolved = true; observer.disconnect(); resolve(false); }} }}, {timeout});
+            observer.observe(document.body, {{
+                childList: true,
+                subtree: true,
+                attributes: true,
+                characterData: false
+            }});
+            setTimeout(() => {{
+                if (!resolved) {{
+                    resolved = true;
+                    observer.disconnect();
+                    resolve(false);
+                }}
+            }}, {timeout});
         }})""")
         if mutated:
             await wait_for_page_settled(page, timeout=15_000)
@@ -56,6 +89,7 @@ async def wait_for_dom_mutation(page, timeout: int = 8_000) -> bool:
 
 
 async def scroll_into_view(page, selector: str) -> None:
+    """Scroll the element into the viewport before interacting."""
     try:
         await page.locator(selector).scroll_into_view_if_needed(timeout=5_000)
     except Exception:
@@ -63,9 +97,16 @@ async def scroll_into_view(page, selector: str) -> None:
 
 
 async def get_all_inputs(page) -> list[dict]:
+    """
+    Return EVERY input/select/textarea in the DOM regardless of visibility.
+    """
     return await page.evaluate(r"""() => {
         function bestSelector(el) {
-            if (el.id) return /[.:#\[\]()~+>]/.test(el.id) ? `[id="${el.id}"]` : '#' + el.id;
+            if (el.id) {
+                return /[.:#\[\]()~+>]/.test(el.id)
+                    ? `[id="${el.id}"]`
+                    : '#' + el.id;
+            }
             if (el.name) return `[name="${el.name}"]`;
             let parent = el.parentElement;
             while (parent && parent !== document.body) {
@@ -78,78 +119,126 @@ async def get_all_inputs(page) -> list[dict]:
             }
             return el.tagName.toLowerCase();
         }
+
         function isVisible(el) {
             const r = el.getBoundingClientRect();
             if (r.width === 0 || r.height === 0) return false;
             const s = window.getComputedStyle(el);
             return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
         }
+
         return [...document.querySelectorAll('input, select, textarea')].map(el => ({
-            selector: bestSelector(el), tag: el.tagName.toLowerCase(), type: el.type || null,
-            id: el.id || null, name: el.name || null, placeholder: el.placeholder || null,
-            label: el.labels?.[0]?.innerText?.trim() || el.getAttribute('aria-label') || null,
-            value: el.value || null, visible: isVisible(el), disabled: el.disabled,
-            required: el.required || false, file_input: el.type === 'file',
+            selector:    bestSelector(el),
+            tag:         el.tagName.toLowerCase(),
+            type:        el.type || null,
+            id:          el.id || null,
+            name:        el.name || null,
+            placeholder: el.placeholder || null,
+            label:       el.labels?.[0]?.innerText?.trim() ||
+                         el.getAttribute('aria-label') || null,
+            value:       el.value || null,
+            visible:     isVisible(el),
+            disabled:    el.disabled,
+            required:    el.required || false,
+            file_input:  el.type === 'file',
         }));
     }""")
 
 
 async def get_form_errors(page) -> list[dict]:
+    """
+    Scrape ALL validation errors from the page.
+    """
     return await page.evaluate(r"""() => {
-        const errors = [], seen = new Set();
+        const errors = [];
+        const seen = new Set();
+
         function bestSelector(el) {
-            if (el.id) return /[.:#\[\]()~+>]/.test(el.id) ? `[id="${el.id}"]` : '#' + el.id;
+            if (el.id) return /[.:#\[\]()~+>]/.test(el.id)
+                ? `[id="${el.id}"]` : `#${el.id}`;
             if (el.name) return `[name="${el.name}"]`;
             return el.tagName.toLowerCase();
         }
-        function addError(sel, label, msg) {
-            const key = `${sel}::${msg}`;
-            if (msg && !seen.has(key)) { seen.add(key); errors.push({ selector: sel, label, error: msg.trim() }); }
+
+        function addError(selector, label, msg) {
+            const key = `${selector}::${msg}`;
+            if (msg && !seen.has(key)) {
+                seen.add(key);
+                errors.push({ selector, label, error: msg.trim() });
+            }
         }
+
         document.querySelectorAll('[aria-invalid="true"]').forEach(field => {
-            const sel = bestSelector(field);
-            const label = field.getAttribute('aria-label') || field.placeholder || field.name || field.id || null;
+            const selector = bestSelector(field);
+            const label = field.getAttribute('aria-label')
+                || field.placeholder || field.name || field.id || null;
+
             const describedBy = field.getAttribute('aria-describedby');
             if (describedBy) {
                 describedBy.split(/\s+/).forEach(id => {
                     const el = document.getElementById(id);
-                    if (el?.innerText?.trim()) addError(sel, label, el.innerText.trim());
+                    const txt = el?.innerText?.trim();
+                    if (txt) addError(selector, label, txt);
                 });
             }
-            let ancestor = field.parentElement, depth = 0;
+
+            let ancestor = field.parentElement;
+            let depth = 0;
             while (ancestor && depth < 5) {
                 ancestor.querySelectorAll('*').forEach(child => {
                     if (child === field) return;
                     const cls = (child.className || '').toLowerCase();
                     const role = (child.getAttribute('role') || '').toLowerCase();
-                    if (/error|invalid|danger|feedback|alert|warn|help/.test(cls) || role === 'alert' || role === 'status') {
+                    const isErrorNode =
+                        /error|invalid|danger|feedback|alert|warn|help/.test(cls) ||
+                        role === 'alert' || role === 'status';
+                    if (isErrorNode) {
                         const txt = child.innerText?.trim();
-                        if (txt) addError(sel, label, txt);
+                        if (txt) addError(selector, label, txt);
                     }
                 });
-                if (errors.find(e => e.selector === sel)) break;
-                ancestor = ancestor.parentElement; depth++;
+                if (errors.find(e => e.selector === selector)) break;
+                ancestor = ancestor.parentElement;
+                depth++;
             }
         });
-        const errorQuery = ['[role="alert"]','[role="status"]','[aria-live="polite"]','[aria-live="assertive"]',
-            '[class*="error"]','[class*="invalid"]','[class*="danger"]','[class*="feedback"]','[class*="warning"]'].join(', ');
+
+        const errorQuery = [
+            '[role="alert"]', '[role="status"]', '[aria-live="polite"]',
+            '[aria-live="assertive"]', '[class*="error"]', '[class*="invalid"]',
+            '[class*="danger"]', '[class*="feedback"]', '[class*="warning"]',
+        ].join(', ');
+
         document.querySelectorAll(errorQuery).forEach(el => {
             const txt = el.innerText?.trim();
             if (!txt || txt.length > 300) return;
             const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) addError(null, 'page-level', txt);
+            if (rect.width > 0 && rect.height > 0) {
+                addError(null, 'page-level', txt);
+            }
         });
+
         return errors;
     }""")
 
 
 async def get_labeled_snapshot(page) -> list[dict]:
+    """Label every interactive element with data-ai-id and return a snapshot."""
     await page.evaluate("""() => {
         let idx = 0;
-        document.querySelectorAll('a, button, input, select, textarea, video, option, [onclick], [role="button"], [role="link"], [role="option"], [role="listbox"], [role="combobox"], [role="searchbox"], [role="menuitem"], [tabindex]:not([tabindex="-1"])')
-            .forEach(el => { if (!el.hasAttribute('data-ai-id')) el.setAttribute('data-ai-id', `ai-${idx++}`); });
+        document.querySelectorAll(
+            'a, button, input, select, textarea, video, option, ' +
+            '[onclick], [role="button"], [role="link"], ' +
+            '[role="option"], [role="listbox"], [role="combobox"], ' +
+            '[role="searchbox"], [role="menuitem"], ' +
+            '[tabindex]:not([tabindex="-1"])'
+        ).forEach(el => {
+            if (!el.hasAttribute('data-ai-id'))
+                el.setAttribute('data-ai-id', `ai-${idx++}`);
+        });
     }""")
-    return await page.evaluate(r"""() => {
+
+    snapshot = await page.evaluate(r"""() => {
         function isVisible(el) {
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
@@ -157,52 +246,84 @@ async def get_labeled_snapshot(page) -> list[dict]:
             if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
             return rect.top < window.innerHeight && rect.bottom > 0;
         }
+
         function getLabel(el) {
-            return el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') ||
-                el.labels?.[0]?.innerText?.trim() || el.placeholder || el.getAttribute('name') ||
-                el.innerText?.trim().slice(0, 80) || el.getAttribute('data-tooltip') || el.value || null;
+            return (
+                el.getAttribute('aria-label') ||
+                el.getAttribute('title') ||
+                el.getAttribute('alt') ||
+                el.labels?.[0]?.innerText?.trim() ||
+                el.placeholder ||
+                el.getAttribute('name') ||
+                el.innerText?.trim().slice(0, 80) ||
+                el.getAttribute('data-tooltip') ||
+                el.value || null
+            );
         }
-        return [...document.querySelectorAll('[data-ai-id]')].filter(isVisible).map(el => ({
-            id: el.getAttribute('data-ai-id'), tag: el.tagName.toLowerCase(),
-            type: el.type || el.getAttribute('role') || null, name: el.name || null,
-            label: getLabel(el), value: el.value ?? null,
-            checked: el.type === 'checkbox' || el.type === 'radio' ? el.checked : null,
-            options: el.tagName === 'SELECT' ? [...el.options].map(o => ({ value: o.value, text: o.text })) : null,
-            href: el.href || el.closest('a')?.href || null,
-            error: (() => {
-                if (el.getAttribute('aria-invalid') !== 'true') return null;
-                const desc = el.getAttribute('aria-describedby');
-                if (desc) {
-                    const msgs = desc.split(/\s+/).map(id => document.getElementById(id)?.innerText?.trim()).filter(Boolean);
-                    if (msgs.length) return msgs.join(' | ');
-                }
-                let ancestor = el.parentElement, depth = 0;
-                while (ancestor && depth < 5) {
-                    for (const child of ancestor.querySelectorAll('*')) {
-                        if (child === el) continue;
-                        const cls = (child.className || '').toLowerCase();
-                        const role = (child.getAttribute('role') || '').toLowerCase();
-                        if (/error|invalid|danger|feedback|alert|warn|help/.test(cls) || role === 'alert' || role === 'status') {
-                            const txt = child.innerText?.trim(); if (txt) return txt;
-                        }
+
+        return [...document.querySelectorAll('[data-ai-id]')]
+            .filter(isVisible)
+            .map(el => ({
+                id:       el.getAttribute('data-ai-id'),
+                tag:      el.tagName.toLowerCase(),
+                type:     el.type || el.getAttribute('role') || null,
+                name:     el.name || null,
+                label:    getLabel(el),
+                value:    el.value ?? null,
+                checked:  el.type === 'checkbox' || el.type === 'radio'
+                            ? el.checked : null,
+                options:  el.tagName === 'SELECT'
+                            ? [...el.options].map(o => ({ value: o.value, text: o.text }))
+                            : null,
+                href:     el.href || el.closest('a')?.href || null,
+                error:    (() => {
+                    if (el.getAttribute('aria-invalid') !== 'true') return null;
+                    const desc = el.getAttribute('aria-describedby');
+                    if (desc) {
+                        const msgs = desc.split(/\s+/)
+                            .map(id => document.getElementById(id)?.innerText?.trim())
+                            .filter(Boolean);
+                        if (msgs.length) return msgs.join(' | ');
                     }
-                    ancestor = ancestor.parentElement; depth++;
-                }
-                return 'invalid (no message found)';
-            })(),
-            selector: el.id ? (/[.:#\[\]()~+>]/.test(el.id) ? `[id="${el.id}"]` : `#${el.id}`)
-                : el.getAttribute('name') ? `[name="${el.getAttribute('name')}"]`
-                : `[data-ai-id="${el.getAttribute('data-ai-id')}"]`
-        }));
+                    let ancestor = el.parentElement, depth = 0;
+                    while (ancestor && depth < 5) {
+                        for (const child of ancestor.querySelectorAll('*')) {
+                            if (child === el) continue;
+                            const cls = (child.className || '').toLowerCase();
+                            const role = (child.getAttribute('role') || '').toLowerCase();
+                            if (/error|invalid|danger|feedback|alert|warn|help/.test(cls)
+                                    || role === 'alert' || role === 'status') {
+                                const txt = child.innerText?.trim();
+                                if (txt) return txt;
+                            }
+                        }
+                        ancestor = ancestor.parentElement;
+                        depth++;
+                    }
+                    return 'invalid (no message found)';
+                })(),
+                selector: el.id
+                    ? (/[.:#\[\]()~+>]/.test(el.id) ? `[id="${el.id}"]` : `#${el.id}`)
+                    : el.getAttribute('name')
+                        ? `[name="${el.getAttribute('name')}"]`
+                        : `[data-ai-id="${el.getAttribute('data-ai-id')}"]`
+            }));
     }""")
+
+    return snapshot
 
 
 def _clean_json(raw: str) -> str:
-    if not raw: return ""
+    """Strip markdown fences and whitespace from LLM output."""
+    if not raw:
+        return ""
     cleaned = raw.strip()
-    if cleaned.startswith("```json"): cleaned = cleaned[7:]
-    elif cleaned.startswith("```"): cleaned = cleaned[3:]
-    if cleaned.endswith("```"): cleaned = cleaned[:-3]
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
     return cleaned.strip()
 
 
@@ -211,22 +332,33 @@ def _clean_json(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-async def control_web_browser_tool(default_browser_path: str, url: str, goals: list[str]) -> str:
+async def control_web_browser_tool(default_browser_path: str, url: str, context_for_agent: str, goals: list[str]) -> str:
     """
     Use this tool whenever the user wants to DO something on a website.
     """
-    print(f'browser_path={default_browser_path}, url={url}, goals={goals}')
+    print(f'browser_path={default_browser_path}, url={url}, context_for_agent={context_for_agent} goals={goals}')
 
     try:
         p = await async_playwright().start()
         browser = await p.chromium.launch(
-            headless=False, executable_path=default_browser_path,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox",
-                  "--autoplay-policy=no-user-gesture-required", "--disable-infobars", "--start-maximized"],
+            headless=False,
+            executable_path=default_browser_path,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-infobars",
+                "--start-maximized",
+            ],
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}, locale="en-US",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         page = await context.new_page()
@@ -236,91 +368,112 @@ async def control_web_browser_tool(default_browser_path: str, url: str, goals: l
 
         system_prompt = f"""
 You are a goal-based browser agent. You control the browser by selecting elements and performing actions.
+Context from the parent: 
+<context>{context_for_agent}</context>
 
 Return ONLY a valid JSON object — no markdown, no explanation — with this exact shape:
 {{
-    "action": "fill | type | click | check | uncheck | upload_file | select | hover | scroll | wait_for_page | wait_for_element | inspect_page | done | wait_for_user | return_content_to_the_parent | go_to_previous_page | close_browser | navigate | ask_user",
-    "selector": "valid CSS selector string (empty string when not needed)",
-    "value": "text to fill / option value to select / URL to navigate to (empty string if not needed)",
+    "action":         "fill | type | click | check | uncheck | upload_file | select | hover | scroll | wait_for_page | wait_for_element | inspect_page | done | wait_for_user | return_content_to_the_parent | go_to_previous_page | close_browser | navigate | ask_user",
+    "selector":       "valid CSS selector string (empty string when not needed)",
+    "value":          "text to fill / option value to select / URL to navigate to (empty string if not needed)",
     "goal_completed": "description of what was just accomplished, or null"
 }}
 
 --- ACTION REFERENCE ---
 
 fill      – Clear an <input> or <textarea> and type new text. Does NOT press Enter.
-            Use for ALL text fields. NEVER press Enter after fill.
+            Use for ALL text fields, search boxes, email/password inputs, textareas.
+            NEVER press Enter after fill — let the agent handle submission separately.
 
-type      – Type text character-by-character WITHOUT clearing first. Does NOT press Enter.
+type      – Type text character-by-character WITHOUT clearing first (for auto-complete
+            inputs where clearing breaks suggestions). Does NOT press Enter.
 
-click     – Click any element (buttons, links, dropdown triggers).
-            NEVER use click on checkboxes or radio buttons — use check/uncheck.
+click     – Click any element (buttons, links, custom dropdown triggers, submit buttons).
+            NEVER use click on checkboxes or radio buttons — use check/uncheck instead.
             After clicking a submit/next/continue button, last_action_result will include
             any validation errors found. Fix ALL errors before clicking submit again.
 
 upload_file – Upload a file to an <input type="file"> element.
-            "value" is the absolute file path. Do NOT click the upload button first.
+            "selector" targets the file input (often hidden behind a styled button).
+            "value" is the absolute path to the file on disk.
+            Do NOT click the upload button first; set_input_files bypasses the dialog.
 
-check     – Set a checkbox or radio to CHECKED. Safe even if already checked.
+check     – Set a checkbox or radio to CHECKED. Safe to call even if already checked.
+            Always use this instead of click for checkboxes/radios.
 
-uncheck   – Set a checkbox to UNCHECKED. Safe even if already unchecked.
+uncheck   – Set a checkbox to UNCHECKED. Safe to call even if already unchecked.
 
 select    – Set the value of a NATIVE <select> element directly.
             "value" must be the <option> value attribute (not display text).
-            If options show value="" use visible text instead.
+            If the options list shows value="" use the visible text instead.
+            After selecting, the tool detects if the page re-rendered new fields.
 
-inspect_page – Dump ALL inputs/selects/textareas and buttons in the DOM.
-            Use this whenever you are unsure what selector to use.
+inspect_page – Dump ALL input/select/textarea elements in the DOM (including hidden ones)
+            with their real selectors, labels, current values, and visibility flags.
+            Use this whenever wait_for_element times out or you are unsure what
+            selector to use. "selector" and "value" can be empty.
 
-wait_for_element – Wait until a specific selector becomes visible.
-            Use AFTER select/click that triggers conditional content.
+wait_for_element – Wait until a specific selector becomes visible before continuing.
+            Use this AFTER a select/click that triggers conditional content.
+            IMPORTANT: always use wait_for_element before trying to fill/click any element
+            that did not exist before the last select or click action.
 
-hover     – Hover over an element to reveal hidden menus.
+hover     – Hover over an element to reveal hidden menus or tooltips before clicking.
 
-scroll    – Scroll the page. "value" = "up" | "down" | pixel offset.
+scroll    – Scroll the page. "value" should be "up" | "down" | a pixel offset like "500".
 
-wait_for_page – Wait for the page to finish loading.
+wait_for_page – Explicitly wait for the page to finish loading.
 
-navigate  – Go to a new URL. Put full URL in "value".
+navigate  – Go to a new URL. Put the full URL in "value".
 
-go_to_previous_page – Press browser Back button.
+go_to_previous_page – Press the browser Back button.
 
-done      – All goals are complete AND the form has been submitted successfully.
+done      – All goals are complete. Return a summary.
 
-wait_for_user – Hand control to the user.
+wait_for_user – Hand control to the user (e.g. CAPTCHA, 2FA, video playing).
 
-return_content_to_the_parent – Return raw HTML, then close.
+return_content_to_the_parent – Return the raw HTML of the current page, then close.
 
 close_browser – Close the browser session.
 
-ask_user  – ONLY for info the page cannot provide: credentials, personal data.
+ask_user  – ONLY for information the page itself cannot provide:
+            credentials, personal data, decisions. 
+            NEVER use this to ask about UI elements, selectors, or button labels.
 
---- FORM FILLING STRATEGY (CRITICAL — FOLLOW EXACTLY) ---
-
-When the goal involves filling out a form:
-  1. FIRST: use inspect_page to see ALL fields, their current values, and the submit button.
-  2. For EACH empty or incorrect field: use fill/type/select/check/uncheck to set the correct value.
-  3. After ALL fields are correctly filled, you MUST click the submit button using action="click".
-  4. After clicking submit, read last_action_result:
-     - If it says "FORM VALIDATION ERRORS DETECTED": fix EVERY error field, then click submit AGAIN.
-     - If it says "no validation errors": the form was submitted successfully.
-  5. ONLY after successful submission (no errors), return action="done".
-  6. There can be cases like you have update a value in the form but the error message is still there, you can try to submit the form and see if error message is gone.
-  7. If you are filling a multi-page/multi-step form like in a job website, Do not say done after filling the first page, fill all the required fields and complete the complete submission
-  
-
-  IMPORTANT: If a field already has the correct value, you do NOT need to fill it again.
-  But you MUST still click submit to complete the form.
+--- FORM FILLING STRATEGY (CRITICAL) ---
+When filling out a form with multiple fields:
+  1. First, use inspect_page to see ALL fields and their current values.
+  2. Fill each field ONE AT A TIME using action="fill".
+  3. NEVER press Enter after filling a field — only the final submit should trigger submission.
+  4. For dropdowns (<select>), use action="select" with the option VALUE (not text).
+  5. After each select, read last_action_result carefully:
+     - "Page re-rendered" → new fields appeared. Use inspect_page to see them.
+     - "No DOM change" → the select worked but no new fields appeared.
+     - "dropdown value did NOT change" → the select failed. Retry or try label instead.
+  6. For checkboxes/radios, use check/uncheck (NEVER click).
+  7. Only click the submit button AFTER all required fields are filled.
+  8. If validation errors appear after submit, fix EVERY error field, then submit again.
+  9. If you don't find fields in the form that is in the context, skip it. Do not try to search it.
 
 --- GENERAL RULES ---
-- NEVER use ask_user for CSS selectors or button labels. Use inspect_page instead.
-- If you see a cookie/consent banner, dismiss it FIRST.
+- NEVER use ask_user to request a CSS selector, button label, or any UI detail.
+  If you cannot find a button or field, use inspect_page.
+- Before clicking Next/Submit/Continue: if you don't see it in <page_elements>,
+  run inspect_page and look for visible buttons with text like "next", "submit", "continue".
+- If you see a cookie/consent banner, dismiss it FIRST (click "Reject all" or "Accept all").
 - Before interacting with any element, scroll it into view.
-- After navigation or significant DOM change, use wait_for_page.
+- After any action that triggers navigation or significant DOM change, use wait_for_page.
 - For NATIVE dropdowns (<select>): use action="select".
-- For CUSTOM dropdowns (div/ul based): use action="click" to open, then click option.
-- If wait_for_element times out → use inspect_page immediately. NEVER retry same selector.
+- For CUSTOM dropdowns (div/ul based): use action="click" to open, then click the option.
+
+- If wait_for_element times out even ONCE:
+    → Immediately use inspect_page before any other action.
+    → Use the exact selector from inspect_page output.
+    → NEVER retry wait_for_element with the same selector that already timed out.
+
 - If the same action+selector repeats without progress → use inspect_page.
-- Once a video is PLAYING, return action="wait_for_user".
+- Once a video is PLAYING, immediately return action="wait_for_user".
+- If the same error repeats twice, try an alternative selector or strategy.
 
 Goals to complete IN ORDER:
 {json.dumps(goals)}
@@ -354,10 +507,12 @@ Goals to complete IN ORDER:
             try:
                 raw = response["messages"][-1].content or ""
                 cleaned = _clean_json(raw)
+
                 if not cleaned:
                     raise ValueError("Empty response from agent")
 
                 goal = json.loads(cleaned)
+
                 if "action" not in goal:
                     raise ValueError(f"Missing 'action' key. Parsed: {cleaned[:200]}")
 
@@ -366,40 +521,56 @@ Goals to complete IN ORDER:
                 value = goal.get("value", "")
                 goal_completed = goal.get("goal_completed")
 
-                print(f"[AGENT] action={action} | selector={selector} | value={str(value)[:60]} | goal={goal_completed}")
+                print(
+                    f"[AGENT] action={action} | selector={selector} "
+                    f"| value={str(value)[:60]} | goal={goal_completed}"
+                )
 
-                # ── Loop-guard ─────────────────────────────────────────
+                # ── Loop-guard check ─────────────────────────────────────────
                 key = (action, selector, value)
                 recent_actions.append(key)
                 if len(recent_actions) > LOOP_THRESHOLD:
                     recent_actions.pop(0)
 
-                if len(recent_actions) == LOOP_THRESHOLD and len(set(recent_actions)) == 1:
+                if (
+                    len(recent_actions) == LOOP_THRESHOLD
+                    and len(set(recent_actions)) == 1
+                ):
                     all_inputs = await get_all_inputs(page)
                     current_value = None
                     if selector:
                         try:
-                            current_value = await page.evaluate("(sel) => { const el = document.querySelector(sel); return el ? el.value : null; }", selector)
+                            current_value = await page.evaluate(
+                                f"(sel) => {{ const el = document.querySelector(sel); return el ? el.value : null; }}",
+                                selector
+                            )
                         except Exception:
                             pass
+
                     last_result = (
-                        f"⚠️ LOOP DETECTED — same action '{action}' on '{selector}' repeated {LOOP_THRESHOLD} times.\n"
+                        f"⚠️ LOOP DETECTED — same action '{action}' on '{selector}' "
+                        f"repeated {LOOP_THRESHOLD} times with no progress.\n"
                         f"Current value of '{selector}': {current_value!r}\n"
-                        f"ALL inputs in DOM:\n{json.dumps(all_inputs, indent=2)}\n"
-                        "INSTRUCTIONS: Stop retrying. Use inspect_page to verify state, then pick correct selector."
+                        f"ALL inputs/selects/textareas in DOM right now:\n"
+                        f"{json.dumps(all_inputs, indent=2)}\n"
+                        "INSTRUCTIONS: Stop retrying this action. Use inspect_page to verify "
+                        "the current page state, then pick the correct selector from the list above."
                     )
                     recent_actions.clear()
-                    print(f"[LOOP-GUARD] Diagnostic injected.")
+                    print(f"[LOOP-GUARD] Diagnostic injected. Selectors: {[i['selector'] for i in all_inputs]}")
                     continue
 
-                # ── Actions ──────────────────────────────────────────
+                # ── Actions ──────────────────────────────────────────────────
 
                 if action == "fill":
                     await page.wait_for_selector(selector, state="visible", timeout=15_000)
                     await scroll_into_view(page, selector)
                     await page.locator(selector).click()
                     await page.locator(selector).fill(value)
+                    # DO NOT press Enter — let the agent control submission
                     await wait_for_page_settled(page)
+                    await page.locator(selector).blur()
+
                     last_result = f"Filled '{selector}' with '{value}'"
 
                 elif action == "type":
@@ -428,7 +599,7 @@ Goals to complete IN ORDER:
                     last_result = f"Unchecked '{selector}' (was_checked={is_checked})"
 
                 elif action == "upload_file":
-                    await page.wait_for_selector(selector, timeout=15_000)
+                    await page.wait_for_selector(selector, state='attached', timeout=15_000)
                     await page.locator(selector).set_input_files(value)
                     await wait_for_dom_mutation(page, timeout=5_000)
                     last_result = f"Uploaded file '{value}' to '{selector}'"
@@ -437,15 +608,20 @@ Goals to complete IN ORDER:
                     await page.wait_for_selector(selector, state="visible", timeout=15_000)
                     await scroll_into_view(page, selector)
 
+                    # FIXED: Use proper string formatting instead of broken f-string with escaped braces
+                    selector_json = json.dumps(selector)
                     el_type = await page.evaluate(
-                        "(sel) => { const el = document.querySelector(sel); return el ? (el.type || el.tagName.toLowerCase()) : null; }",
+                        f"(sel) => {{ const el = document.querySelector(sel); return el ? (el.type || el.tagName.toLowerCase()) : null; }}",
                         selector
                     )
                     el_text = await page.evaluate(
-                        "(sel) => { const el = document.querySelector(sel); return el ? (el.innerText || el.value || '').trim().toLowerCase() : ''; }",
+                        f"(sel) => {{ const el = document.querySelector(sel); return el ? (el.innerText || el.value || '').trim().toLowerCase() : ''; }}",
                         selector
                     )
-                    is_submit = el_type in ("submit",) or any(w in el_text for w in ("next", "submit", "continue", "proceed", "apply", "save"))
+                    is_submit = (
+                        el_type in ("submit",)
+                        or any(w in el_text for w in ("next", "submit", "continue", "proceed", "apply", "save"))
+                    )
 
                     await page.locator(selector).click()
                     await wait_for_page_settled(page)
@@ -454,11 +630,15 @@ Goals to complete IN ORDER:
                         errors = await get_form_errors(page)
                         if errors:
                             last_result = (
-                                f"Clicked '{selector}' (submit). ⚠️ FORM VALIDATION ERRORS DETECTED — do NOT move to next goal.\n"
-                                f"Fix ALL errors below, then click submit again:\n{json.dumps(errors, indent=2)}\n"
-                                "NEXT STEPS: (1) fix each field using its selector, (2) click submit again, (3) only proceed when no errors."
+                                f"Clicked '{selector}' (submit). "
+                                f"⚠️ FORM VALIDATION ERRORS DETECTED — do NOT move to next goal.\n"
+                                f"Fix ALL errors below, then click submit again:\n"
+                                f"{json.dumps(errors, indent=2)}\n"
+                                "NEXT STEPS: (1) fix each field using its selector, "
+                                "(2) once all fixed, click submit again, "
+                                "(3) only proceed when no errors appear."
                             )
-                            print(f"[SUBMIT] Errors: {errors}")
+                            print(f"[SUBMIT] Errors found: {errors}")
                         else:
                             last_result = f"Clicked '{selector}' (submit) — no validation errors"
                     else:
@@ -468,7 +648,10 @@ Goals to complete IN ORDER:
                     await page.wait_for_selector(selector, state="visible", timeout=15_000)
                     await scroll_into_view(page, selector)
 
-                    value_before = await page.evaluate("(sel) => { const el = document.querySelector(sel); return el?.value ?? null; }", selector)
+                    value_before = await page.evaluate(
+                        f"(sel) => {{ const el = document.querySelector(sel); return el?.value ?? null; }}",
+                        selector
+                    )
 
                     try:
                         selected = await page.locator(selector).select_option(value=value)
@@ -479,14 +662,23 @@ Goals to complete IN ORDER:
                         await page.locator(selector).select_option(label=value)
                         last_result = f"Selected option label='{value}' in '{selector}'"
 
-                    value_after = await page.evaluate("(sel) => { const el = document.querySelector(sel); return el?.value ?? null; }", selector)
+                    value_after = await page.evaluate(
+                        f"(sel) => {{ const el = document.querySelector(sel); return el?.value ?? null; }}",
+                        selector
+                    )
 
                     if value_before == value_after:
-                        last_result += f" | ⚠️ WARNING: dropdown value did NOT change (still '{value_after}')."
+                        last_result += (
+                            f" | ⚠️ WARNING: dropdown value did NOT change "
+                            f"(still '{value_after}'). Option may be disabled or JS-controlled."
+                        )
                     else:
                         mutated = await wait_for_dom_mutation(page, timeout=8_000)
                         if mutated:
-                            last_result += " | ✅ Page re-rendered after selection — new elements available."
+                            last_result += (
+                                " | ✅ Page re-rendered after selection — "
+                                "new elements available. Check <page_elements> before next action."
+                            )
                         else:
                             last_result += " | No DOM change detected after selection"
 
@@ -500,14 +692,17 @@ Goals to complete IN ORDER:
                         last_result = (
                             f"❌ Timeout: '{selector}' did not appear within 15s.\n"
                             f"ALL inputs in DOM:\n{json.dumps(all_inputs, indent=2)}\n"
-                            "Do NOT retry same selector. Find correct one from list above."
+                            "1. Do NOT retry same selector.\n"
+                            "2. Find correct selector from list above.\n"
+                            "3. If field visible=false, re-trigger the parent dropdown first."
                         )
 
                 elif action == "inspect_page":
                     all_inputs = await get_all_inputs(page)
                     all_buttons = await page.evaluate(r"""() => {
                         function bestSelector(el) {
-                            if (el.id) return /[.:#\[\]()~+>]/.test(el.id) ? `[id="${el.id}"]` : '#' + el.id;
+                            if (el.id) return /[.:#\[\]()~+>]/.test(el.id)
+                                ? `[id="${el.id}"]` : '#' + el.id;
                             if (el.name) return `[name="${el.name}"]`;
                             const ai = el.getAttribute('data-ai-id');
                             if (ai) return `[data-ai-id="${ai}"]`;
@@ -519,15 +714,24 @@ Goals to complete IN ORDER:
                             const s = window.getComputedStyle(el);
                             return s.display !== 'none' && s.visibility !== 'hidden';
                         }
-                        return [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button], a[href]')].map(el => ({
-                            selector: bestSelector(el), tag: el.tagName.toLowerCase(),
-                            type: el.type || el.getAttribute('role') || null,
-                            text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 80),
-                            visible: isVisible(el), disabled: el.disabled || false,
+                        const els = [
+                            ...document.querySelectorAll(
+                                'button, input[type=submit], input[type=button], ' +
+                                '[role=button], a[href]'
+                            )
+                        ];
+                        return els.map(el => ({
+                            selector: bestSelector(el),
+                            tag:      el.tagName.toLowerCase(),
+                            type:     el.type || el.getAttribute('role') || null,
+                            text:     (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 80),
+                            visible:  isVisible(el),
+                            disabled: el.disabled || false,
                         }));
                     }""")
                     last_result = (
-                        f"inspect_page result:\nFORM FIELDS:\n{json.dumps(all_inputs, indent=2)}\n\n"
+                        f"inspect_page result:\n"
+                        f"FORM FIELDS:\n{json.dumps(all_inputs, indent=2)}\n\n"
                         f"BUTTONS/LINKS:\n{json.dumps(all_buttons, indent=2)}\n"
                         "Use 'selector' from this list. Check 'visible' and 'disabled' before clicking."
                     )
@@ -585,7 +789,11 @@ Goals to complete IN ORDER:
 
                 elif action == "ask_user":
                     await browser.close()
-                    return f"Needs input from user:\n<context><url>{url}</url></context>\nQuestion: {value}"
+                    return (
+                        f"Needs input from user:\n"
+                        f"<context><url>{url}</url></context>\n"
+                        f"Question: {value}"
+                    )
 
                 else:
                     last_result = f"Unrecognized action: '{action}'"
@@ -608,4 +816,7 @@ Goals to complete IN ORDER:
             await browser.close()
         except Exception:
             pass
-        return f"Exception occurred: {e}\nDO NOT reopen the browser. Please explain what happened to the user."
+        return (
+            f"Exception occurred: {e}\n"
+            "DO NOT reopen the browser. Please explain what happened to the user."
+        )
